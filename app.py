@@ -28,6 +28,9 @@ from langchain_core.documents import Document
 from dotenv import load_dotenv
 # Importa biblioteca para ler PDFs
 import PyPDF2
+# Importa o cliente admin do Azure Search para gerenciar índices
+from azure.search.documents.indexes import SearchIndexClient
+from azure.core.credentials import AzureKeyCredential
 
 # Carrega as variáveis de ambiente do arquivo .env
 load_dotenv()
@@ -43,6 +46,30 @@ AZURE_OPENAI_CHAT_API_KEY = os.getenv("AZURE_OPENAI_CHAT_API_KEY", os.getenv("AZ
 AZURE_OPENAI_API_VERSION = "2024-06-01"  # Versão estável que suporta embeddings e chat
 AZURE_EMBEDDINGS_MODEL = os.getenv("AZURE_EMBEDDING_MODEL", "text-embedding-3-large")
 AZURE_OPENAI_MODEL = os.getenv("AZURE_OPENAI_MODEL", "gpt-5.4-mini")
+
+def clear_index_and_reinitialize():
+    """Apaga o índice Azure Search e reinicializa o vector store com índice vazio"""
+    try:
+        # Deleta o índice existente
+        index_client = SearchIndexClient(
+            endpoint=AZURE_AI_SEARCH_SERVICE_NAME,
+            credential=AzureKeyCredential(AZURE_AI_SEARCH_API_KEY)
+        )
+        index_client.delete_index(AZURE_AI_SEARCH_INDEX_NAME)
+    except Exception:
+        pass  # Ignora se o índice não existir ainda
+
+    # Recria o vector store (LangChain recria o índice automaticamente)
+    vector_store = AzureSearch(
+        embedding_function=st.session_state.embeddings.embed_query,
+        azure_search_endpoint=AZURE_AI_SEARCH_SERVICE_NAME,
+        azure_search_key=AZURE_AI_SEARCH_API_KEY,
+        index_name=AZURE_AI_SEARCH_INDEX_NAME,
+        vector_search_dimensions=3072,
+    )
+    st.session_state.vector_store = vector_store
+    return vector_store
+
 
 def initialize_azure_services():
     """Inicializa os serviços do Azure"""
@@ -139,6 +166,10 @@ def process_uploaded_file_fallback(uploaded_file, vector_store):
         loader = PyPDFLoader(tmp_file_path)
         docs = loader.load()
         
+        # Corrige o source para o nome original do arquivo (PyPDFLoader usa o caminho tmp)
+        for doc in docs:
+            doc.metadata["source"] = uploaded_file.name
+        
         # Divide o texto em pedaços menores
         text_splitter = TokenTextSplitter(chunk_size=1000, chunk_overlap=100)
         split_docs = text_splitter.split_documents(docs)
@@ -166,11 +197,21 @@ def process_uploaded_file_fallback(uploaded_file, vector_store):
         # Força o garbage collector a liberar memória
         gc.collect()
 
-def custom_search_and_answer(question, vector_store, llm, max_docs=3):
+def custom_search_and_answer(question, vector_store, llm, max_docs=3, current_files=None):
     """Busca documentos relevantes e gera resposta usando o LLM"""
     try:
-        # Busca os documentos mais parecidos com a pergunta
-        docs = vector_store.similarity_search(question, k=max_docs)
+        # Busca mais documentos do que o necessário para poder filtrar depois
+        fetch_k = max_docs * 5 if current_files else max_docs
+        docs = vector_store.similarity_search(question, k=fetch_k)
+
+        # Filtra no Python os documentos dos arquivos atualmente carregados
+        if current_files:
+            filtered = [
+                d for d in docs
+                if d.metadata.get("source") in current_files
+            ][:max_docs]
+            # Se o filtro retornar vazio, usa todos os resultados como fallback
+            docs = filtered if filtered else docs[:max_docs]
         
         if not docs:
             return "Não foram encontrados documentos relevantes para responder sua pergunta.", []
@@ -301,13 +342,17 @@ def main():
                 
                 total_chunks = 0
                 processed_files = []
+                # Limpa o índice antes de processar novos documentos
+                st.session_state.current_files = []
+                with st.spinner("Limpando índice anterior..."):
+                    vector_store = clear_index_and_reinitialize()
                 
                 for i, uploaded_file in enumerate(uploaded_files):
                     status_text.text(f"Processando: {uploaded_file.name}")
                     
                     chunks, preview = process_uploaded_file(
-                        uploaded_file, 
-                        st.session_state.vector_store
+                        uploaded_file,
+                        vector_store
                     )
                     
                     if chunks > 0:
@@ -317,6 +362,8 @@ def main():
                             'chunks': chunks,
                             'preview': preview
                         })
+                        # Registra o arquivo como ativo para filtrar buscas
+                        st.session_state.current_files.append(uploaded_file.name)
                     
                     progress_bar.progress((i + 1) / len(uploaded_files))
                 
@@ -379,7 +426,8 @@ def main():
                             custom_question,
                             st.session_state.vector_store,
                             st.session_state.llm,
-                            max_docs=3
+                            max_docs=3,
+                            current_files=st.session_state.get('current_files', [])
                         )
                         
                         st.subheader("📋 Resposta:")
